@@ -112,6 +112,17 @@ def _normalize_account_name(name: str) -> str:
     name = name.replace("勘定科目", "").replace("科目", "")  # 「勘定科目」などの語句を除去
     return name
 
+def _norm_liab_header(s) -> str:
+    """負債セクションの見出し名を表記ゆれ込みで正規化する。
+    「引当金の部」「引当金合計」「引当金計」「引当金部」「引当金」→ すべて "引当金"。
+    「負債合計」「負債の部合計」→ "負債"。などの判定に使う。
+    """
+    t = _normalize_account_name(s)
+    for w in ("（", "）", "(", ")", "[", "]", "【", "】", "▲", "△", "・", "　", " "):
+        t = t.replace(w, "")
+    t = t.replace("の部", "").replace("合計", "").replace("小計", "").replace("計", "").replace("部", "")
+    return t
+
 def _get_amount_triplet(item: dict) -> list:
     """辞書から今期、前期、前々期の金額を整数で取得する。"""
     now_val = to_int_safe_bs(item.get("今期", {}).get("金額", 0) if isinstance(item.get("今期"), dict) else item.get("今期", 0))
@@ -155,6 +166,9 @@ debug_info = {
 
 # 全データを統合するリスト
 final_output_list = []
+
+# レスポンス(output.json)に含める処理ログ（引当金の部 補完など）
+_process_log = []
 
 # ============================================================
 # 【A】 1〜78行目の処理をここに入れる
@@ -2596,6 +2610,62 @@ def get_v(no, p):
 
 periods = ["前々期", "前期", "今期"]
 
+# ============================================================
+# 「引当金の部」取りこぼし対策（旧商法式BS：負債=流動／固定／引当金の部 の3区分）
+#   負債合計(65) は権威値（引当金の部を含む）だが、流動(56)＋固定(64) には引当金の部が
+#   入らず、下流が明細合算でCFを作る際に取りこぼす。
+#   残差 = 負債合計(65) − 流動(56) − 固定(64) を算出し、空の固定負債スロット(57〜63)に
+#   明細配置（分類=固定負債）＋固定負債合計(64)に加算（65は権威値なので変更しない）。
+#   ・残差ベース（名前非依存）＝「引当金合計/引当金計/引当金部」等の表記ゆれにも自動対応
+#   ・冪等：引当金の部が無いデータ（残差0）では何もしない
+# ============================================================
+_v65 = {p: get_v(65.0, p) for p in periods}   # 負債合計（権威値・引当金の部を含む）
+_v56 = {p: get_v(56.0, p) for p in periods}   # 流動負債合計
+_v64 = {p: get_v(64.0, p) for p in periods}   # 固定負債合計
+_resid = {p: _v65[p] - _v56[p] - _v64[p] for p in periods}
+if (65.0 in data_map) and any(abs(_resid[p]) > 0 for p in periods):
+    # 名称・クロスチェック用：入力BSから「引当金（の部/合計/計/部）」見出し行を探す（勘定科目名で判定）
+    _found_vals, _found_name = (None, None)
+    for _it in source_data.get("BS", []):
+        if _norm_liab_header(_it.get("勘定科目", "")) == "引当金":
+            _found_vals = _get_amount_triplet(_it)  # [今, 前, 前々]
+            _found_name = str(_it.get("勘定科目", "") or "").strip()
+            break
+    _hikiate_name = _found_name if _found_name else "引当金の部"
+    # 空の固定負債スロット(57〜63)に明細配置（このプロジェクトは _section_for_row が無いため分類を明示）
+    _placed_slot = None
+    for _slot in range(57, 64):
+        _r = data_map.get(float(_slot))
+        if _r is not None and not str(_r.get("勘定科目", "") or "").strip() \
+           and all(to_f(_r.get(p, 0)) == 0 for p in periods):
+            _r["勘定科目"] = _hikiate_name
+            _r["分類"] = "固定負債"
+            for p in periods:
+                _r[p] = _resid[p]
+            _r["集計方法"] = "引当金の部（負債合計−流動−固定の残差で補完）"
+            _placed_slot = _slot
+            break
+    # 固定負債合計(64) に残差を加算（65=負債合計 は権威値なので変更しない）
+    _r64 = data_map.get(64.0)
+    if _r64 is not None:
+        for p in periods:
+            _r64[p] = to_f(_r64.get(p, 0)) + _resid[p]
+    # クロスチェック：残差(計算値) と 入力の引当金見出し行(直接値) を突き合わせ
+    _xcheck = "入力に引当金セクション見出し行が見つからず（残差のみで補完）"
+    if _found_vals is not None:
+        _fv = {"今期": _found_vals[0], "前期": _found_vals[1], "前々期": _found_vals[2]}
+        _diff = {p: _resid[p] - _fv[p] for p in periods}
+        if all(_diff[p] == 0 for p in periods):
+            _xcheck = f"一致OK（入力「{_found_name}」今期={_fv['今期']} と残差が一致）"
+        else:
+            _xcheck = (f"⚠不一致：入力「{_found_name}」今期={_fv['今期']} vs 残差今期={_resid['今期']} "
+                       f"差={_diff['今期']}（要確認：負債合計/流動/固定にOCR誤差の可能性）")
+    _msg = (f"引当金の部 補完：名称={_hikiate_name}／残差(今/前/前々)="
+            f"[{_resid['今期']:.0f}, {_resid['前期']:.0f}, {_resid['前々期']:.0f}]／"
+            f"配置スロット={_placed_slot if _placed_slot else '無し(64のみ加算)'}／{_xcheck}")
+    _process_log.append(_msg)
+    print(f"[引当金の部 補完] {_msg}")
+
 # --- 4. 全行の構成比を再計算 (79, 80行の追加処理を削除) ---
 sorted_rows = []
 for no in sorted(data_map.keys()):
@@ -2621,6 +2691,20 @@ for no in sorted(data_map.keys()):
 
     sorted_rows.append(row)
 #sorted_rows.append(debug_info)
+
+# --- 処理ログをレスポンス(output.json)に含める（引当金の部 補完など）---
+#   金額ゼロのログ行として末尾に追加（下流のCF対象外＝集計に影響しない）。
+for _li, _logmsg in enumerate(_process_log):
+    sorted_rows.append({
+        "行番号": 9001 + _li,
+        "勘定科目": "【補完ログ】",
+        "前々期": 0, "前期": 0, "今期": 0,
+        "区分": "",
+        "集計方法": _logmsg,
+        "分類": "ログ",
+        "前々期構成比": 0.0, "前期構成比": 0.0, "今期構成比": 0.0,
+    })
+
 # --- 5. 保存 ---
 with Path("output.json").open("w", encoding="utf-8") as f:
     json.dump(sorted_rows, f, ensure_ascii=False, indent=2)
